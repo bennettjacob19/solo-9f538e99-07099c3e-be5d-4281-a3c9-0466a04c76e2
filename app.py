@@ -3,6 +3,11 @@
 流程：上传新图（≤32 KiB，切 4 KiB 块，至多 8 块）→ 登记 2~4 台终端首播
 实收块号 → 逐轮规划补传（限帧数、限各终端异或解码次数，可注入某终端漏收
 某帧）→ 各终端独立拼图，SHA-256 与新图相符才替换可下载的旧图。
+
+并发约定：规划计算不持有全局锁，规划期间可下载终端当前图、上传新图、登记
+终端并发起新一轮补传；每次状态变更推进单调递增的纪元号，规划完成时纪元
+已变（新图载入、终端重登记、他轮先落地等）则丢弃该次规划结果，不发帧、
+不改轮次记录、终端进度与下载图。
 """
 import hashlib
 import io
@@ -11,8 +16,8 @@ import threading
 from flask import (Flask, flash, redirect, render_template, request,
                    send_file, url_for)
 
-from planner import (CHUNK_SIZE, MAX_CHUNKS, MAX_FRAME_LIMIT, apply_round,
-                     plan_round, reassemble, split_chunks)
+from planner import (CHUNK_SIZE, MAX_CHUNKS, MAX_FRAME_LIMIT, SearchAborted,
+                     apply_round, plan_round, reassemble, split_chunks)
 
 app = Flask(__name__)
 app.secret_key = "multicast-repair-drill-dev-key"
@@ -20,6 +25,16 @@ app.secret_key = "multicast-repair-drill-dev-key"
 LOCK = threading.Lock()
 MIN_TERMINALS = 2
 MAX_TERMINALS = 4
+
+# 演练状态纪元号：单调递增，重置也不回退，供过期规划判定。
+_epoch = 0
+
+
+def _bump_epoch():
+    """推进纪元号（须在持有 LOCK 时调用），返回新值。"""
+    global _epoch
+    _epoch += 1
+    return _epoch
 
 
 def _fresh_state():
@@ -107,6 +122,7 @@ def upload():
             "chunks": chunks,
             "data": data,
         }
+        _bump_epoch()  # 新图载入：此前未落地的规划结果一律作废
     flash(f"已载入新图：{f.filename}，{size} 字节，切为 {len(chunks)} 块。请登记终端首播实收块号。")
     return redirect(url_for("index"))
 
@@ -142,6 +158,7 @@ def setup_terminals():
             return redirect(url_for("index"))
         STATE["terminals"] = terminals
         STATE["rounds"] = []
+        _bump_epoch()  # 终端重登记：进行中的旧规划结果作废
         # 首播即收齐的终端立即校验替换
         full = (1 << n) - 1
         for t in terminals:
@@ -208,8 +225,32 @@ def run_round():
             if 0 <= fi < len(terms) and fn >= 1:
                 fault = (fi, fn)
 
+        # 快照本轮输入，随后释放锁：规划期间下载、上传新图、登记终端、
+        # 发起新一轮补传都不必等本次计算结束。
         masks = [t["mask"] for t in terms]
-        frames = plan_round(masks, quotas, frame_limit, n)
+        epoch = _epoch
+
+    def _stale():
+        with LOCK:
+            return _epoch != epoch
+
+    try:
+        frames = plan_round(masks, quotas, frame_limit, n,
+                            should_abort=_stale)
+    except SearchAborted:
+        frames = None
+        stale = True
+    else:
+        stale = False
+
+    with LOCK:
+        if stale or _epoch != epoch:
+            # 规划期间状态已变化（新图/终端/轮次已更新）：旧规划结果不得
+            # 发帧，也不得改轮次记录、终端进度或下载图。
+            flash("规划期间演练状态已变化，本轮规划结果已丢弃，未发送任何帧；"
+                  "请按当前状态重新发起。")
+            return redirect(url_for("index"))
+        terms = STATE["terminals"]
         if frames is None:
             flash("无方案：本轮限额内无法让各站收齐，已保留各站已收块，未发送任何帧。")
             return redirect(url_for("index"))
@@ -248,6 +289,7 @@ def run_round():
             "fault": (terms[fault[0]]["name"], fault[1]) if fault else None,
             "terminals": rec_terminals,
         })
+        _bump_epoch()  # 本轮落地：基于本轮前状态的其他在途规划作废
         done = sum(1 for t in terms if t["completed"])
         flash(f"第 {len(STATE['rounds'])} 轮已发送 {len(frames)} 帧；{done}/{len(terms)} 台已收齐并校验替换。")
     return redirect(url_for("index"))
@@ -258,6 +300,7 @@ def reset():
     with LOCK:
         STATE.clear()
         STATE.update(_fresh_state())
+        _bump_epoch()  # 演练重置：在途规划结果作废
     flash("演练已重置。")
     return redirect(url_for("index"))
 
